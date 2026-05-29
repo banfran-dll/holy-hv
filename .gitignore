@@ -1,0 +1,74 @@
+# =========================
+# Third-party (do not commit)
+# =========================
+HolyHypervisor/edk2/
+HolyHypervisor/openssl/
+SecureHack-main/
+SecureHack.zip
+Voyager/
+Voyager.zip
+edk2.zip
+extracted/
+temp_edk2/
+HolyBoot/
+
+# =========================
+# Build artifacts
+# =========================
+HolyHypervisor_Release/
+HolyHypervisor_Release.zip
+projects/x64/
+**/x64/Debug/
+**/x64/Release/
+**/Debug/
+**/Release/
+**/obj/
+*.efi
+*.sys
+*.exe
+*.obj
+*.pdb
+*.lib
+*.dll
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+*.cache
+*.tlog
+
+# =========================
+# Visual Studio
+# =========================
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.aps
+*.tmp
+
+# =========================
+# Misc / scratch
+# =========================
+logs/
+check.py
+LaunchPutty.bat
+_archive_pre_v41/
+*.crt
+*.cer
+*.pfx
+
+# =========================
+# Large binary blobs / tools
+# =========================
+HolyHypervisor/debugger/
+HolyHypervisor/nasm/
+HolyHypervisor/nasm.zip
+HolyHypervisor/img/
+
+# =========================
+# Editor / IDE state
+# =========================
+.claude/
+.vscode/
