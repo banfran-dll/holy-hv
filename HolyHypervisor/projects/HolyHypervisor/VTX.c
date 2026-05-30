@@ -153,47 +153,37 @@ VOID HandleVTL1ToVTL0Intel(PGUEST_CONTEXT context)
     }
 }
 
-// v35: Voyager-confirmed VMEXIT layout.
+#include "HolyProtocol.h"
+
 //
-// All earlier probes (v30..v34) failed to locate guest state because they made
-// two wrong assumptions:
+// VMEXIT layout (confirmed against this build of hvix64.exe via IDA + probes):
 //
-//   1. They treated the first arg as `pcontext_t` directly. In Voyager's
-//      WINVER > 1803 path the signature is `vmexit_handler(pcontext_t* ctx, ...)`
-//      -- POINTER TO POINTER. The real context lives at `*ctx`, not `ctx`.
+//   sub_2118A0(DISPATCHER_CTX *ctx, uint32_t status)
 //
-//   2. They keyed off guest RAX as the magic leaf. Voyager's protocol uses
-//      `guest_registers->rcx == VMEXIT_KEY` as the trigger; RAX is unused
-//      for routing and RDX carries the sub-command.
+//   ctx (= rcx at function entry) is a small dispatcher wrapper.
+//   *ctx (first qword) is a pointer to the guest GPR save area, laid out as:
+//     [+0x00] = guest RAX     [+0x40] = guest R8
+//     [+0x08] = guest RCX     [+0x48] = guest R9
+//     [+0x10] = guest RDX     ...
+//     [+0x18] = guest RBX     [+0x78] = guest R15
 //
-// Voyager's context_t layout (Intel payload, types.h):
+// Protocol (see HolyProtocol.h) -- trigger:
+//   CPUID with RCX == HOLY_KEY and RAX == HOLY_CMD_*.
 //
-//      offset  field    used here
-//      ------  -----    ---------
-//      0x00    rax      response RAX (sentinel out)
-//      0x08    rcx      magic key in
-//      0x10    rdx      command in
-//      0x18    rbx      response RBX
-//      0x20    rsp
-//      0x28    rbp
-//      0x30    rsi
-//      0x38    rdi
-//      0x40    r8       data buffer ptr in (Voyager convention)
-//      ...
+// The hook must contain NO indirect branches (CET-IBT). Our payload's .data
+// is copied into hv's .text padding which is RX, so any write to a payload
+// global would page-fault. Instead, the EFI side fills g_HolyScratch with
+// the address of one page of hv .data padding (RW in hv's own PT) before
+// CopyMem; we only ever READ g_HolyScratch here, then WRITE through it.
 //
-// Matching user-mode probe (build & run on guest):
+// Vendor-ID spoof on CPUID(0x40000000) makes ours appear as "HolyHv Backd"
+// to any in-guest detector probing for a hypervisor.
 //
-//      #include <intrin.h>
-//      #include <stdio.h>
-//      int main(void) {
-//          int r[4] = {0};
-//          __cpuidex(r, 0, 0xDEADC0DE);   // EAX=command(=0), ECX=KEY
-//          printf("eax=%08X ebx=%08X ecx=%08X edx=%08X\n",
-//                 r[0], r[1], r[2], r[3]);
-//      }
-//
-// Expected on hit: eax=DEADBEEF ebx=C0FFEE01 ecx=CAFEBABE edx=FEEDFACE.
-#define HOLY_VMEXIT_KEY 0xDEADC0DEull
+
+// g_HolyScratch lives in our payload's .data. Defined below so it lands in
+// the copied PE; the EFI side overwrites it pre-CopyMem with the address of
+// one RW page inside hv's .data padding.
+extern UINT64 g_HolyScratch;
 
 UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
 {
@@ -201,126 +191,88 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
 
     UINT64 exitReason = 0;
     __vmx_vmread(HOLY_VMCS_EXIT_REASON, &exitReason);
-    if ((exitReason & 0xFFFFu) != 10) {
-        return 0;   // not CPUID -> pass through
-    }
-
-    // v37 ECHO diagnostic.
-    //
-    // The hv disasm (thanks user) confirmed the layout:
-    //
-    //   context = DISPATCHER_CTX*  (rcx at sub_2118A0 entry)
-    //   gprs    = *(GUEST_GPR_SAVE**)context  (first qword of DISPATCHER_CTX)
-    //   gprs->rax = gprs[0], gprs->rcx = gprs[1],
-    //   gprs->rdx = gprs[2], gprs->rbx = gprs[3], ...
-    //
-    // dispatcher 0x23E000 unconditionally calls sub_2118A0 for every VMEXIT
-    // (no fast-path skip for CPUID), and gprs[1] is set to guest RCX at
-    // 0x23E35C and never touched again before our hook.
-    //
-    // But v35 (which checks gprs[1] == KEY) didn't fire on the user-mode test.
-    // Two remaining possibilities to distinguish:
-    //
-    //   A. The user-mode test's MSVC __cpuidex(buf, 0, 0xDEADC0DE) did NOT
-    //      put 0xDEADC0DE into ECX as we assumed (compiler/wrapper interfered).
-    //   B. Our deref / hook entry is fundamentally wrong despite matching the
-    //      disasm.
-    //
-    // This v37 drops the KEY check entirely. For every user-mode CPUID exit
-    // we echo the actual guest input registers back as sentinels:
-    //
-    //     gprs[0] (out RAX) <- 0xAA000000 | (guest_RAX & 0xFFFF)
-    //     gprs[1] (out RCX) <- 0xBB000000 | (guest_RCX & 0xFFFF)
-    //     gprs[2] (out RDX) <- 0xCC000000 | (guest_RDX & 0xFFFF)
-    //     gprs[3] (out RBX) <- 0xDD000000 | (guest_RBX & 0xFFFF)
-    //
-    // Then skip orig + advance RIP. User-mode kernel CPUIDs (e.g. early init)
-    // are unaffected because the RIP filter excludes kernel mode. User-space
-    // CPUIDs will see this echo on every call -- most programs tolerate weird
-    // CPUID output (graceful feature-detection fallback).
-    //
-    // Decoding (per user-mode dword R):
-    //   (R >> 24) == 0xAA  -> hook reached gprs[0]; low 16 bits = guest RAX
-    //   (R >> 24) == 0xBB  -> hook reached gprs[1]; low 16 bits = guest RCX
-    //   (R >> 24) == 0xCC  -> hook reached gprs[2]; low 16 bits = guest RDX
-    //   (R >> 24) == 0xDD  -> hook reached gprs[3]; low 16 bits = guest RBX
-    //
-    // If user-mode test (__cpuidex(r,0,0xDEADC0DE)) gets back:
-    //   r[0]=0xAA0000xx, r[1]=0xDD0000xx, r[2]=0xBB00C0DE, r[3]=0xCC0000xx
-    // then everything works, layout is correct, and the v35 magic check
-    // would have hit -- the v35 failure was just compiler quirks in the test.
-    //
-    // If r[2] != 0xBB00C0DE: hv saw a different ECX than we expected.
-    //   The lower 16 bits of r[2] tell us what ECX actually was at CPUID time.
-    // If r[*] != 0xAA/BB/CC/DD: hook didn't fire OR deref/offset wrong.
-    // v38: kernel-mode CPUID with explicit ECX key.
-    //
-    // v37 (user-mode-only echo) silently passed through every user CPUID.
-    // The combination of (a) v29 having hung when ALL CPUIDs were intercepted,
-    // (b) Voyager/Tulach articles confirming user CPUID is unconditionally
-    // trapped, and (c) the disasm confirming sub_2118A0 is always called,
-    // means user-mode CPUID DOES reach our hook but our deref+offset assumption
-    // doesn't survive on that path -- either the dispatcher ctx layout is
-    // different for user-mode exits, or canonical check on gprs is rejecting
-    // a non-kernel pointer that we should still trust.
-    //
-    // v38 sidesteps the question. Hook is now triggered from a kernel-mode
-    // driver (HolyHvProbe) which calls __cpuidex(0, 0xDEADC0DE). Kernel CPUID
-    // always traps. Filter:
-    //
-    //     kernel-mode RIP   AND   (UINT32)gprs[1] == 0xDEADC0DE
-    //
-    // The ECX==KEY check protects all other kernel CPUIDs (boot stays safe).
-    // If hook fires and the driver-issued CPUID returns 0xDEADBEEF etc, we
-    // confirm everything works for kernel CPUID; user-mode failure was a
-    // separate VMCS / dispatch path issue we can chase later.
-    // v41: protocol stage 1 -- PING command.
-    //
-    // v40 result locked the layout: gprs = *(UINT64**)context, and the GPR
-    // save area uses the standard Voyager / user-disasm offsets
-    //   gprs[0] = RAX, gprs[1] = RCX, gprs[2] = RDX, gprs[3] = RBX, ...
-    //
-    // The strict `> 0xFFFF800000000000` canonical check was the silent killer
-    // in v35/v38 -- this hv stores the GPR save area in low-canonical mapped
-    // memory, so we accept any plausibly non-NULL pointer (> 0x1000).
-    //
-    // Protocol (user-mode and kernel-mode both work):
-    //   CPUID with  RCX == HOLY_HV_MAGIC_KEY     -> hook intercepts
-    //               RAX == command code
-    //   On return:  RAX/RBX/RCX/RDX hold command-specific response
-    //
-    // Commands implemented in v41:
-    //   COMMAND_PING (0x10000001) -> RAX=0xDEADBEEF RBX=0xC0FFEE01
-    //                                RCX=0xCAFEBABE RDX=0xFEEDFACE
-    //
-    // Magic key is a 32-bit unique value carried in guest ECX; false-positive
-    // collision with a real kernel CPUID's ECX is astronomically unlikely.
-    UINT64 rip = 0, len = 0;
-    __vmx_vmread(HOLY_VMCS_GUEST_RIP, &rip);
+    if ((exitReason & 0xFFFFu) != 10) return 0;   // not CPUID -> pass through
 
     if ((UINT64)context <= 0x1000ull) return 0;
     UINT64* gprs = *(UINT64**)context;
     if ((UINT64)gprs <= 0x1000ull) return 0;
 
-    if ((UINT32)gprs[1] != (UINT32)HOLY_VMEXIT_KEY) return 0;
+    // Hypervisor Vendor ID spoofing (CPUID leaf 0x40000000)
+    if ((UINT32)gprs[0] == 0x40000000u) {
+        gprs[0] = 0x40000000u; // Max CPUID leaf
+        gprs[3] = 0x796C6F48u; // "Holy" (EBX)
+        gprs[1] = 0x42207648u; // "Hv B" (ECX)
+        gprs[2] = 0x646B6361u; // "ackd" (EDX)
 
-    switch ((UINT32)gprs[0]) {
-        case 0x10000001u:   // COMMAND_PING
-            gprs[0] = 0xDEADBEEFull;   // -> guest RAX
-            gprs[3] = 0xC0FFEE01ull;   // -> guest RBX
-            gprs[1] = 0xCAFEBABEull;   // -> guest RCX
-            gprs[2] = 0xFEEDFACEull;   // -> guest RDX
+        UINT64 rip = 0, len = 0;
+        __vmx_vmread(HOLY_VMCS_GUEST_RIP, &rip);
+        __vmx_vmread(HOLY_VMCS_VMEXIT_INSTRUCTION_LENGTH, &len);
+        __vmx_vmwrite(HOLY_VMCS_GUEST_RIP, rip + len);
+        return 1;
+    }
+
+    if ((UINT32)gprs[1] != HOLY_KEY) return 0;     // not our backdoor
+
+    // Update bookkeeping in our hv .data scratch (RW).
+    HOLY_SCRATCH* scratch = (HOLY_SCRATCH*)g_HolyScratch;
+    if (scratch) {
+        if (scratch->magic != HOLY_SCRATCH_MAGIC) {
+            scratch->magic = HOLY_SCRATCH_MAGIC;
+            scratch->vmexit_count = 0;
+        }
+        scratch->vmexit_count++;
+        scratch->last_exit_reason = exitReason & 0xFFFFu;
+        __vmx_vmread(HOLY_VMCS_GUEST_RIP, &scratch->last_guest_rip);
+    }
+
+    const UINT32 cmd = (UINT32)gprs[0];
+    UINT64 outA = 0, outB = 0, outC = 0;
+    UINT32 status = HOLY_STATUS_OK;
+
+    switch (cmd) {
+        case HOLY_CMD_PING:
+            outA = 0xC0FFEE01ull;
+            outB = 0xCAFEBABEull;
+            outC = 0xFEEDFACEull;
             break;
+
+        case HOLY_CMD_GET_CR3:
+            __vmx_vmread(HOLY_VMCS_GUEST_CR3, &outA);
+            break;
+
+        case HOLY_CMD_GET_HOOK_RVA:
+            outA = (UINT64)OriginalVmExitHandlerIntelAddr;
+            break;
+
+        case HOLY_CMD_GET_VMEXIT_COUNT:
+            outA = scratch ? scratch->vmexit_count     : 0;
+            outB = scratch ? scratch->last_exit_reason : 0;
+            outC = scratch ? scratch->last_guest_rip   : 0;
+            break;
+
+        case HOLY_CMD_GET_SCRATCH:
+            outA = g_HolyScratch;
+            outB = sizeof(HOLY_SCRATCH);
+            outC = scratch ? scratch->magic : 0;
+            break;
+
         default:
-            // Unknown command: clear the response regs so the caller can tell.
-            gprs[0] = 0;
-            gprs[1] = 0;
-            gprs[2] = 0;
-            gprs[3] = 0;
+            status = HOLY_STATUS_UNKNOWN_CMD;
             break;
     }
 
+    gprs[0] = (UINT64)status;
+    gprs[3] = outA;
+    gprs[1] = outB;
+    gprs[2] = outC;
+
+    UINT64 rip = 0, len = 0;
+    __vmx_vmread(HOLY_VMCS_GUEST_RIP, &rip);
     __vmx_vmread(HOLY_VMCS_VMEXIT_INSTRUCTION_LENGTH, &len);
     __vmx_vmwrite(HOLY_VMCS_GUEST_RIP, rip + len);
     return 1;
 }
+
+// Definition: lands in our payload's .data so it travels with CopyMem.
+// EFI side overwrites this pre-CopyMem.
+UINT64 g_HolyScratch = 0;

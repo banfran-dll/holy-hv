@@ -153,13 +153,51 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
     (VOID)newOffset;
 
     // OriginalVmExitHandlerIntelAddr must be set before CopyMem so the copied
-    // payload carries the real address via RIP-relative load. (Only meaningful
-    // at STAGE_PATCH; harmless to set unconditionally.)
+    // payload carries the real address via RIP-relative load.
 #if HOLY_HV_MUTATION_STAGE >= HOLY_HV_MUTATION_STAGE_PATCH
     if (isIntel) {
         OriginalVmExitHandlerIntelAddr = scan + 24 + *(INT32*)(scan + 20);
     }
 #endif
+
+    // Find one RW page inside hv's .data padding for our scratch struct.
+    // Same trick as the .text padding: extend the section's VirtualSize so
+    // the page falls inside hv's own self-map and is mapped RW.
+    extern UINT64 g_HolyScratch;
+    {
+        PIMAGE_SECTION_HEADER dataSec = NULL;
+        UINT16 dataIdx = 0;
+        for (UINT16 si = 0; si < hvNt->FileHeader.NumberOfSections; si++) {
+            UINT32 ch = hvSecs[si].Characteristics;
+            if ((ch & EFI_IMAGE_SCN_MEM_WRITE) && !(ch & EFI_IMAGE_SCN_MEM_EXECUTE)) {
+                dataSec = &hvSecs[si];
+                dataIdx = si;
+                break;
+            }
+        }
+        if (dataSec) {
+            UINT32 dEndRva     = dataSec->VirtualAddress + dataSec->Misc.VirtualSize;
+            UINT32 scratchRva  = P2ALIGNUP(dEndRva, EFI_PAGE_SIZE);
+            UINT32 nextSecRva2 = (dataIdx + 1 < hvNt->FileHeader.NumberOfSections)
+                                 ? hvSecs[dataIdx + 1].VirtualAddress
+                                 : hvNt->OptionalHeader.SizeOfImage;
+            UINT32 dataPadSize = (nextSecRva2 > scratchRva) ? (nextSecRva2 - scratchRva) : 0;
+            if (dataPadSize >= EFI_PAGE_SIZE) {
+                UINT32 required = (scratchRva + EFI_PAGE_SIZE) - dataSec->VirtualAddress;
+                if (required > dataSec->Misc.VirtualSize) {
+                    dataSec->Misc.VirtualSize = required;
+                }
+                g_HolyScratch = imageBase + scratchRva;
+                DebugFormat("[HOLY] scratch=0x%p rva=0x%X (.data padding)\n",
+                    (VOID*)g_HolyScratch, scratchRva);
+            } else {
+                DebugFormat("[HOLY] .data padding too small (0x%X) -- scratch disabled\n",
+                    dataPadSize);
+            }
+        } else {
+            DebugFormat("[HOLY] no RW section found -- scratch disabled\n");
+        }
+    }
 
     // Copy our PE image into the hv .text padding.
     CopyMem((VOID*)section, (VOID*)&__ImageBase, payloadPeSize);

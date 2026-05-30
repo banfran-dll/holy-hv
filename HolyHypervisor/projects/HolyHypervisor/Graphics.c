@@ -191,6 +191,11 @@ static VOID DrawOverlay(VOID)
     DrawString(CX, VerseY, "\"Yes, my soul, find rest in God;", White, 1);
     VerseY += 22;
     DrawString(CX, VerseY, "my hope comes from him.\"", White, 1);
+
+    // Draw the subtle "Bootkit running!" text at the bottom
+    UINTN BottomY = H - (H * 15 / 100); // 15% from the bottom
+    EFI_GRAPHICS_OUTPUT_BLT_PIXEL Gray = {0xAA, 0xAA, 0xAA, 0x00}; // Subtle gray like the screenshot
+    DrawString(CX, BottomY, "Bootkit running!", Gray, 1);
 }
 
 static EFI_STATUS EFIAPI HookedBlt(
