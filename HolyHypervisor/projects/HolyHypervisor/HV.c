@@ -1,9 +1,14 @@
 #include "Global.h"
 #include "BuildMode.h"
+#include "HolyProtocol.h"
 
 #pragma warning(disable : 4146)
 
 #define P2ALIGNUP(x, align) (-(-(x) & -(align)))
+
+// (winload-stage PT walk removed for now -- triple-faulted because winload's
+//  PT mapping is not phys=virt at BlLdrLoadImage time. The hook will translate
+//  addresses through hv's own PT in a later step.)
 
 extern IMAGE_DOS_HEADER __ImageBase;
 VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
@@ -152,8 +157,15 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
     (VOID)originalFunction;
     (VOID)newOffset;
 
-    // OriginalVmExitHandlerIntelAddr must be set before CopyMem so the copied
-    // payload carries the real address via RIP-relative load.
+    // These must be set before CopyMem so the copied payload carries them.
+    extern UINT64 g_HookRva;
+    extern UINT64 g_HvWinloadBase;
+    extern UINT64 g_ScratchRva;
+    extern UINT64 g_DataSecVa;
+    extern UINT64 g_DataSecVSize;
+    g_HookRva = hookRva;
+    g_HvWinloadBase = imageBase;
+
 #if HOLY_HV_MUTATION_STAGE >= HOLY_HV_MUTATION_STAGE_PATCH
     if (isIntel) {
         OriginalVmExitHandlerIntelAddr = scan + 24 + *(INT32*)(scan + 20);
@@ -176,6 +188,7 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
             }
         }
         if (dataSec) {
+            g_DataSecVa = dataSec->VirtualAddress;
             UINT32 dEndRva     = dataSec->VirtualAddress + dataSec->Misc.VirtualSize;
             UINT32 scratchRva  = P2ALIGNUP(dEndRva, EFI_PAGE_SIZE);
             UINT32 nextSecRva2 = (dataIdx + 1 < hvNt->FileHeader.NumberOfSections)
@@ -187,10 +200,13 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
                 if (required > dataSec->Misc.VirtualSize) {
                     dataSec->Misc.VirtualSize = required;
                 }
+                g_ScratchRva = scratchRva;
+                g_DataSecVSize = dataSec->Misc.VirtualSize;
                 g_HolyScratch = imageBase + scratchRva;
                 DebugFormat("[HOLY] scratch=0x%p rva=0x%X (.data padding)\n",
                     (VOID*)g_HolyScratch, scratchRva);
             } else {
+                g_DataSecVSize = dataSec->Misc.VirtualSize;
                 DebugFormat("[HOLY] .data padding too small (0x%X) -- scratch disabled\n",
                     dataPadSize);
             }

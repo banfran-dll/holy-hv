@@ -1,6 +1,6 @@
 #pragma once
 
-#define HOLY_BUILD_MARKER "STAGE3_TEXT_PADDING_v41_PROTOCOL_PING"
+#define HOLY_BUILD_MARKER "STAGE3_TEXT_PADDING_v53_HOOK_FN_VA"
 
 //
 // hv.exe mutation stages. Each stage adds one more step to ProcessHvImage;

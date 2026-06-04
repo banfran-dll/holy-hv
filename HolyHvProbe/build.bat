@@ -30,4 +30,15 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 echo.
 echo [SUCCESS] HolyHvProbe.sys, cpuid_via_driver.exe, and holyctl.exe built successfully.
+
+echo.
+echo [5] Signing the Driver...
+powershell.exe -ExecutionPolicy Bypass -File .\sign.ps1
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Signing failed.
+    exit /b %ERRORLEVEL%
+)
+
+echo.
+echo [ALL DONE] Build and Signing complete!
 pause
