@@ -47,6 +47,12 @@ UINT64 gHvAllocationReturnValue = 0;
 CHAR16 LoadedImages[20][64];
 UINTN LoadedImageCount = 0;
 
+#define HV_CANDIDATE_MAX 16
+static UINT64 gHvCandidateBase[HV_CANDIDATE_MAX] = {0};
+static UINTN  gHvCandidateSize[HV_CANDIDATE_MAX] = {0};
+static UINT32 gHvCandidateMemType[HV_CANDIDATE_MAX] = {0};
+static UINTN  gHvCandidateCount = 0;
+
 #define HOLY_LOAD_DIAG_LIMIT 20
 
 EFI_GET_VARIABLE OriginalGetVariable = NULL;
@@ -79,22 +85,21 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
     if (EFI_ERROR(status))
         return status;
 
-    CHAR16* imagePath = (CHAR16*)arg2;
-    CHAR16* imageName = (CHAR16*)arg3;
+    // Win11: arg3=path, arg4=name; Win10: arg2=path, arg3=name
+    CHAR16* imageName = arg2 ? (CHAR16*)arg3 : (CHAR16*)arg4;
     PLDR_DATA_TABLE_ENTRY entry = NULL;
 
-    if (arg8)
+    if (arg8 && (UINT64)arg8 > 0x10000)
         entry = *(PLDR_DATA_TABLE_ENTRY*)arg8;
 
-    if (imageName && imagePath)
+    if (imageName)
     {
         static UINTN loadDiagCount = 0;
         if (loadDiagCount < HOLY_LOAD_DIAG_LIMIT)
         {
-            DebugFormat("[HOLY-LOAD] #%ld name=%s path=%s base=0x%p\n",
+            DebugFormat("[HOLY-LOAD] #%ld name=%s base=0x%p\n",
                 loadDiagCount,
                 imageName,
-                imagePath,
                 entry ? (VOID*)entry->ModuleBase : NULL);
             loadDiagCount++;
         }
@@ -135,10 +140,10 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
         {
             if (entry && entry->ModuleBase) {
                 UINT64 winloadBase = entry->ModuleBase;
-                DebugFormat("[HOLY] winload loaded at 0x%p. Scanning allocator patterns...\n", (VOID*)winloadBase);
+                DebugFormat("[HOLY] winload loaded at 0x%p. Resolving exports...\n", (VOID*)winloadBase);
 
-                UINT64 winloadAllocImage = FindPatternImage((VOID*)winloadBase, "48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC ? 48 8B 31 4C 8D 7A FF 45 33 ED");
-                DebugFormat("[HOLY-DIAG] winload BlImgAllocateImageBuffer pattern=0x%p\n", (VOID*)winloadAllocImage);
+                UINT64 winloadAllocImage = GetExport((VOID*)winloadBase, "BlImgAllocateImageBuffer");
+                DebugFormat("[HOLY-DIAG] winload BlImgAllocateImageBuffer export=0x%p\n", (VOID*)winloadAllocImage);
 
                 if (winloadAllocImage && !gHookB2) {
                     BlImgAllocateImageBufferHook = CreateHook((VOID*)winloadAllocImage, (VOID*)HookedBlImgAllocateImageBuffer);
@@ -151,20 +156,8 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
                     }
                 }
 
-                // Direct function-prologue match for BlMmAllocateVirtualPages.
-                // Bytes at FileOffset 0xBED3C in winload.efi:
-                //   48 89 5C 24 08              mov [rsp+8], rbx
-                //   48 89 7C 24 10              mov [rsp+10], rdi
-                //   55                          push rbp
-                //   48 8D 6C 24 A9              lea rbp, [rsp-57h]
-                //   48 81 EC A0 00 00 00        sub rsp, 0A0h
-                //   41 BA 01 00 00 00           mov r10d, 1
-                //   48 8B F9                    mov rdi, rcx
-                //   44 01 15 ?? ?? ?? ??        add [rip+disp32], r10d
-                UINT64 winloadAllocVirtual = FindPatternImage((VOID*)winloadBase,
-                    "48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC A0 00 00 00 41 BA 01 00 00 00 48 8B F9 44 01 15");
-
-                DebugFormat("[HOLY-DIAG] winload BlMmAllocateVirtualPages target=0x%p\n",
+                UINT64 winloadAllocVirtual = GetExport((VOID*)winloadBase, "BlMmAllocateVirtualPages");
+                DebugFormat("[HOLY-DIAG] winload BlMmAllocateVirtualPages export=0x%p\n",
                     (VOID*)winloadAllocVirtual);
 
                 if (winloadAllocVirtual && !gHookB3) {
@@ -181,7 +174,54 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
         }
     }
 
-    // Silent counting only - no serial output to avoid boot timing issues
+    // Win11: hvix64 is not loaded via BlLdrLoadImage. Scan ALL candidate
+    // allocations for the VMEXIT handler signature directly, then walk
+    // back to find the PE base. Runs on every B1 call until found.
+    if (!PatchedHyperV && gHvCandidateCount > 0)
+    {
+        static UINTN scanAttempt = 0;
+        scanAttempt++;
+        for (UINTN ci = 0; ci < gHvCandidateCount && !PatchedHyperV; ci++) {
+            UINT64 base = gHvCandidateBase[ci];
+            UINTN  size = gHvCandidateSize[ci];
+
+            if (scanAttempt == 1) {
+                DebugFormat("[HOLY] scanning candidate #%ld base=0x%p size=0x%llX memType=0x%X\n",
+                    ci, (VOID*)base, (UINT64)size, gHvCandidateMemType[ci]);
+            }
+
+            UINT64 sigMatch = FindPattern((VOID*)base, (UINT64)size, INTEL_VMEXIT_HANDLER_SIG);
+            if (!sigMatch)
+                continue;
+
+            DebugFormat("[HOLY] VMEXIT sig found at 0x%p (candidate #%ld, attempt %ld)\n",
+                (VOID*)sigMatch, ci, scanAttempt);
+
+            // Walk backwards from signature to find PE base (MZ header)
+            UINT64 peBase = sigMatch & ~0xFFFULL;
+            BOOLEAN foundPe = FALSE;
+            while (peBase >= base) {
+                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)peBase;
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+                    dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
+                    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(peBase + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                        DebugFormat("[HOLY] PE base at 0x%p SizeOfImage=0x%X\n",
+                            (VOID*)peBase, nt->OptionalHeader.SizeOfImage);
+                        ProcessHvImage(peBase, L"hvix64.exe");
+                        foundPe = TRUE;
+                        break;
+                    }
+                }
+                peBase -= 0x1000;
+            }
+            if (!foundPe) {
+                DebugFormat("[HOLY] VMEXIT sig found but no PE base (sig=0x%p buf=0x%p)\n",
+                    (VOID*)sigMatch, (VOID*)base);
+            }
+        }
+    }
+
     static UINTN loadCount = 0;
     loadCount++;
     HooksInstalled = (gHookB1 && (gHookB2 || gHookB3));
@@ -232,6 +272,19 @@ static int allocLogCount = 0;
     const UINT64 allocated = ((UINT64(*)(VOID**, UINTN, UINT32, UINT32, VOID*, VOID*))BlImgAllocateImageBufferHook.Trampoline)(
         imageBuffer, imageSize, memoryType, attributes, unknown1, unknown2);
 
+    // Track ALL large allocations as HV candidates — on Win11 hvix64 may use
+    // any MemoryType (observed: 0xD000000A, 0xE0000005, etc.)
+    if (originalSize >= 0x200000 && imageBuffer && *imageBuffer) {
+        if (gHvCandidateCount < HV_CANDIDATE_MAX) {
+            gHvCandidateBase[gHvCandidateCount] = (UINT64)*imageBuffer;
+            gHvCandidateSize[gHvCandidateCount] = originalSize;
+            gHvCandidateMemType[gHvCandidateCount] = originalMemoryType;
+            DebugFormat("[HOLY] HV candidate #%ld: base=0x%p size=0x%llX memType=0x%X\n",
+                gHvCandidateCount, *imageBuffer, (UINT64)originalSize, originalMemoryType);
+            gHvCandidateCount++;
+        }
+    }
+
     if (extendedThisCall)
     {
         VOID* bufferAfter = imageBuffer ? *imageBuffer : NULL;
@@ -273,7 +326,6 @@ UINT64 EFIAPI HookedBlMmAllocateVirtualPages(VOID** Address, UINTN Pages, UINTN 
         virtualAllocLogCount++;
     }
 
-    // Temporarily using MemoryType == 0xD0000004 or Attributes == ATTRIBUTE_HV_IMAGE to see which one works
     if ((MemoryType == 0xD0000004 || Attributes == ATTRIBUTE_HV_IMAGE) && Pages >= (0x200000 >> 12) && !ExtendedSize) {
         ExtendedSize = TRUE;
 #if 1
@@ -286,7 +338,24 @@ UINT64 EFIAPI HookedBlMmAllocateVirtualPages(VOID** Address, UINTN Pages, UINTN 
         DebugFormat("OBSERVATION MODE: Found BlMmAllocateVirtualPages for HV_IMAGE. Skipping expansion. Original Pages requested: %ld\n", (UINT32)Pages);
 #endif
     }
-    return ((UINT64(*)(VOID**, UINTN, UINTN, UINTN, UINTN))BlMmAllocateVirtualPagesHook.Trampoline)(Address, Pages, MemoryType, Attributes, Alignment);
+
+    UINTN origPages = Pages;
+    UINT64 ret = ((UINT64(*)(VOID**, UINTN, UINTN, UINTN, UINTN))BlMmAllocateVirtualPagesHook.Trampoline)(Address, Pages, MemoryType, Attributes, Alignment);
+
+    // Also track large virtual allocations as HV candidates (2MB-64MB range)
+    UINTN allocSize = origPages * EFI_PAGE_SIZE;
+    if (allocSize >= 0x200000 && allocSize <= 0x4000000 && Address && *Address) {
+        if (gHvCandidateCount < HV_CANDIDATE_MAX) {
+            gHvCandidateBase[gHvCandidateCount] = (UINT64)*Address;
+            gHvCandidateSize[gHvCandidateCount] = allocSize;
+            gHvCandidateMemType[gHvCandidateCount] = (UINT32)MemoryType;
+            DebugFormat("[HOLY] HV candidate #%ld (virt): base=0x%p size=0x%llX memType=0x%X\n",
+                gHvCandidateCount, *Address, (UINT64)allocSize, (UINT32)MemoryType);
+            gHvCandidateCount++;
+        }
+    }
+
+    return ret;
 }
 
 static int allocPagesLogCount = 0;
@@ -402,7 +471,7 @@ EFI_STATUS EFIAPI HookedGetVariable(CHAR16* variableName, EFI_GUID* vendorGuid, 
     // Hook internal functions for this module unconditionally!
     DebugFormat("[HOLY] Hooking module internal functions!\n");
     
-    UINT64 allocImage = FindPatternImage((VOID*)moduleBase, "48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC ? 48 8B 31 4C 8D 7A FF 45 33 ED");
+    UINT64 allocImage = GetExport((VOID*)moduleBase, "BlImgAllocateImageBuffer");
     if (allocImage && !gHookB2) {
         BlImgAllocateImageBufferHook = CreateHook((VOID*)allocImage, (VOID*)HookedBlImgAllocateImageBuffer);
         if (BlImgAllocateImageBufferHook.Enabled != -1) {
@@ -410,13 +479,9 @@ EFI_STATUS EFIAPI HookedGetVariable(CHAR16* variableName, EFI_GUID* vendorGuid, 
             DebugFormat("[HOLY] Hooked BlImgAllocateImageBuffer: %d\n", gHookB2);
         }
     }
-    
-    // Direct function-prologue match for BlMmAllocateVirtualPages (FileOffset 0xBED3C
-    // in winload.efi). The previous CALL-site pattern + bogus "+13 + *(INT32*)(+9)"
-    // math no longer matches this winload build.
-    UINT64 allocVirtual = FindPatternImage((VOID*)moduleBase,
-        "48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC A0 00 00 00 41 BA 01 00 00 00 48 8B F9 44 01 15");
-    DebugFormat("[HOLY] BlMmAllocateVirtualPages prologue scan target=0x%p\n", (VOID*)allocVirtual);
+
+    UINT64 allocVirtual = GetExport((VOID*)moduleBase, "BlMmAllocateVirtualPages");
+    DebugFormat("[HOLY] BlMmAllocateVirtualPages export=0x%p\n", (VOID*)allocVirtual);
     if (allocVirtual && !gHookB3) {
         BlMmAllocateVirtualPagesHook = CreateHook((VOID*)allocVirtual, (VOID*)HookedBlMmAllocateVirtualPages);
         if (BlMmAllocateVirtualPagesHook.Enabled != -1) {
@@ -476,7 +541,36 @@ EFI_EXIT_BOOT_SERVICES OriginalExitBootServices = NULL;
 EFI_STATUS EFIAPI HookedExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey)
 {
     mPostEBS = TRUE;
-    
+
+    // Last-chance VMEXIT scan before boot services are gone
+    if (!PatchedHyperV && gHvCandidateCount > 0) {
+        DebugFormat("[HOLY-EBS] Final scan: %ld candidates, PatchedHyperV=%d\n",
+            gHvCandidateCount, PatchedHyperV);
+        for (UINTN ci = 0; ci < gHvCandidateCount && !PatchedHyperV; ci++) {
+            UINT64 base = gHvCandidateBase[ci];
+            UINTN  size = gHvCandidateSize[ci];
+            UINT64 sigMatch = FindPattern((VOID*)base, (UINT64)size, INTEL_VMEXIT_HANDLER_SIG);
+            if (!sigMatch)
+                continue;
+            DebugFormat("[HOLY-EBS] VMEXIT sig at 0x%p (candidate #%ld)\n",
+                (VOID*)sigMatch, ci);
+            UINT64 peBase = sigMatch & ~0xFFFULL;
+            while (peBase >= base) {
+                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)peBase;
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+                    dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
+                    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(peBase + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                        DebugFormat("[HOLY-EBS] PE base at 0x%p\n", (VOID*)peBase);
+                        ProcessHvImage(peBase, L"hvix64.exe");
+                        break;
+                    }
+                }
+                peBase -= 0x1000;
+            }
+        }
+    }
+
     // Restore original UEFI pointers before Windows takes over!
     // If we leave our pointers in the Runtime/Boot tables, Windows will call our freed memory and crash!
     if (OriginalGetVariable) {
