@@ -23,9 +23,12 @@
 #define HOLY_VMCS_VMEXIT_INSTRUCTION_LENGTH      0x0000440C
 
 //
-// Intel specific hook signature (Windows 10 19041/2004)
+// Intel specific hook signature (Windows 11 hvix64.exe)
+// Pattern: mov edx,rbp / call <mitigation> / mov rcx,[rsp+?] / sti /
+//          mov edx,esi / or edx,[rsp+?] / call <handler> / jmp <loop_top>
+// E8 at offset 19, displacement at offset 20 (scan+20 in HV.c).
 //
-#define INTEL_VMEXIT_HANDLER_SIG "65 C6 04 25 6D 00 00 00 00 48 8B 4C 24 ? 48 8B 54 24 ? E8 ? ? ? ? E9"
+#define INTEL_VMEXIT_HANDLER_SIG "8B D5 E8 ? ? ? ? 48 8B 4C 24 ? FB 8B D6 0B 54 24 ? E8 ? ? ? ? E9"
 
 extern UINT64 OriginalVmExitHandlerIntelAddr;
 
