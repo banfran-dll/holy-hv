@@ -57,6 +57,9 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
         return;
     }
 
+    extern UINTN PatchedHyperV;
+    PatchedHyperV = TRUE;
+
     const UINT64 currentImageBase = (UINT64)&__ImageBase;
     const UINT64 targetFunction = isIntel ? (UINT64)HookedVmExitHandlerIntel : (UINT64)HookedVmExitHandler;
     const UINT64 offset = targetFunction - currentImageBase;

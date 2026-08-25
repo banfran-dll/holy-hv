@@ -75,6 +75,38 @@ INTN StriCmp(const CHAR16* str1, const CHAR16* str2)
 UINT64 EFIAPI HookedBlImgAllocateImageBuffer(VOID** imageBuffer, UINTN imageSize, UINT32 memoryType, const UINT32 attributes, VOID* unknown1, VOID* unknown2);
 UINT64 EFIAPI HookedBlMmAllocateVirtualPages(VOID** Address, UINTN Pages, UINTN MemoryType, UINTN Attributes, UINTN Alignment);
 
+static UINT64 ScanCandidatesForHvImage(void)
+{
+    for (UINTN ci = 0; ci < gHvCandidateCount; ci++) {
+        UINT64 base = gHvCandidateBase[ci];
+        UINTN  size = gHvCandidateSize[ci];
+        UINT64 sigMatch = FindPattern((VOID*)base, (UINT64)size, INTEL_VMEXIT_HANDLER_SIG);
+        if (!sigMatch)
+            continue;
+
+        DebugFormat("[HOLY] VMEXIT sig at 0x%p (candidate #%ld)\n",
+            (VOID*)sigMatch, ci);
+
+        UINT64 peBase = sigMatch & ~0xFFFULL;
+        while (peBase >= base) {
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)peBase;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+                dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
+                PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(peBase + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    DebugFormat("[HOLY] PE base at 0x%p SizeOfImage=0x%X\n",
+                        (VOID*)peBase, nt->OptionalHeader.SizeOfImage);
+                    return peBase;
+                }
+            }
+            peBase -= 0x1000;
+        }
+        DebugFormat("[HOLY] VMEXIT sig found but no PE base (sig=0x%p)\n",
+            (VOID*)sigMatch);
+    }
+    return 0;
+}
+
 EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, VOID* arg5, VOID* arg6, VOID* arg7,
     VOID* arg8, VOID* arg9, VOID* arg10, VOID* arg11, VOID* arg12, VOID* arg13, VOID* arg14,
     VOID* arg15, VOID* arg16, VOID* arg17)
@@ -85,8 +117,14 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
     if (EFI_ERROR(status))
         return status;
 
-    // Win11: arg3=path, arg4=name; Win10: arg2=path, arg3=name
-    CHAR16* imageName = arg2 ? (CHAR16*)arg3 : (CHAR16*)arg4;
+    // Win11: arg3=path, arg4=name. Win10: arg2=path, arg3=name.
+    // Check both rather than guessing OS version from arg2.
+    CHAR16* imageName = NULL;
+    if (arg4 && (UINT64)arg4 > 0x10000)
+        imageName = (CHAR16*)arg4;
+    if (arg3 && (UINT64)arg3 > 0x10000 &&
+        (!imageName || (StrStr(imageName, L"\\") && !StrStr((CHAR16*)arg3, L"\\"))))
+        imageName = (CHAR16*)arg3;
     PLDR_DATA_TABLE_ENTRY entry = NULL;
 
     if (arg8 && (UINT64)arg8 > 0x10000)
@@ -174,52 +212,13 @@ EFI_STATUS HookedBlLdrLoadImage(VOID* arg1, VOID* arg2, VOID* arg3, VOID* arg4, 
         }
     }
 
-    // Win11: hvix64 is not loaded via BlLdrLoadImage. Scan ALL candidate
-    // allocations for the VMEXIT handler signature directly, then walk
-    // back to find the PE base. Runs on every B1 call until found.
+    // Win11: hvix64 may not appear via BlLdrLoadImage. Scan candidate
+    // allocations for the VMEXIT handler signature to find it.
     if (!PatchedHyperV && gHvCandidateCount > 0)
     {
-        static UINTN scanAttempt = 0;
-        scanAttempt++;
-        for (UINTN ci = 0; ci < gHvCandidateCount && !PatchedHyperV; ci++) {
-            UINT64 base = gHvCandidateBase[ci];
-            UINTN  size = gHvCandidateSize[ci];
-
-            if (scanAttempt == 1) {
-                DebugFormat("[HOLY] scanning candidate #%ld base=0x%p size=0x%llX memType=0x%X\n",
-                    ci, (VOID*)base, (UINT64)size, gHvCandidateMemType[ci]);
-            }
-
-            UINT64 sigMatch = FindPattern((VOID*)base, (UINT64)size, INTEL_VMEXIT_HANDLER_SIG);
-            if (!sigMatch)
-                continue;
-
-            DebugFormat("[HOLY] VMEXIT sig found at 0x%p (candidate #%ld, attempt %ld)\n",
-                (VOID*)sigMatch, ci, scanAttempt);
-
-            // Walk backwards from signature to find PE base (MZ header)
-            UINT64 peBase = sigMatch & ~0xFFFULL;
-            BOOLEAN foundPe = FALSE;
-            while (peBase >= base) {
-                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)peBase;
-                if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
-                    dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
-                    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(peBase + dos->e_lfanew);
-                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                        DebugFormat("[HOLY] PE base at 0x%p SizeOfImage=0x%X\n",
-                            (VOID*)peBase, nt->OptionalHeader.SizeOfImage);
-                        ProcessHvImage(peBase, L"hvix64.exe");
-                        foundPe = TRUE;
-                        break;
-                    }
-                }
-                peBase -= 0x1000;
-            }
-            if (!foundPe) {
-                DebugFormat("[HOLY] VMEXIT sig found but no PE base (sig=0x%p buf=0x%p)\n",
-                    (VOID*)sigMatch, (VOID*)base);
-            }
-        }
+        UINT64 peBase = ScanCandidatesForHvImage();
+        if (peBase)
+            ProcessHvImage(peBase, L"hvix64.exe");
     }
 
     static UINTN loadCount = 0;
@@ -542,33 +541,11 @@ EFI_STATUS EFIAPI HookedExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey)
 {
     mPostEBS = TRUE;
 
-    // Last-chance VMEXIT scan before boot services are gone
     if (!PatchedHyperV && gHvCandidateCount > 0) {
-        DebugFormat("[HOLY-EBS] Final scan: %ld candidates, PatchedHyperV=%d\n",
-            gHvCandidateCount, PatchedHyperV);
-        for (UINTN ci = 0; ci < gHvCandidateCount && !PatchedHyperV; ci++) {
-            UINT64 base = gHvCandidateBase[ci];
-            UINTN  size = gHvCandidateSize[ci];
-            UINT64 sigMatch = FindPattern((VOID*)base, (UINT64)size, INTEL_VMEXIT_HANDLER_SIG);
-            if (!sigMatch)
-                continue;
-            DebugFormat("[HOLY-EBS] VMEXIT sig at 0x%p (candidate #%ld)\n",
-                (VOID*)sigMatch, ci);
-            UINT64 peBase = sigMatch & ~0xFFFULL;
-            while (peBase >= base) {
-                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)peBase;
-                if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
-                    dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
-                    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(peBase + dos->e_lfanew);
-                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                        DebugFormat("[HOLY-EBS] PE base at 0x%p\n", (VOID*)peBase);
-                        ProcessHvImage(peBase, L"hvix64.exe");
-                        break;
-                    }
-                }
-                peBase -= 0x1000;
-            }
-        }
+        DebugFormat("[HOLY-EBS] Final scan: %ld candidates\n", gHvCandidateCount);
+        UINT64 peBase = ScanCandidatesForHvImage();
+        if (peBase)
+            ProcessHvImage(peBase, L"hvix64.exe");
     }
 
     // Restore original UEFI pointers before Windows takes over!
