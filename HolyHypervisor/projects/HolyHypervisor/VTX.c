@@ -212,11 +212,23 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
 
     if ((UINT32)gprs[1] != HOLY_KEY) return 0;     // not our backdoor
 
-    // v48: scratch bookkeeping disabled to test whether the .data padding
-    // page is actually writable in the new hv's PT. If ping comes back with
-    // sentinels OK after this build, the .data padding mapping changed in
-    // the Windows Update and we need a different RW scratch location.
     HOLY_SCRATCH* scratch = NULL;
+    {
+        extern UINT64 g_ScratchRva;
+        extern UINT64 g_HookRva;
+        if (g_ScratchRva != 0) {
+            extern IMAGE_DOS_HEADER __ImageBase;
+            UINT64 hvBase = (UINT64)&__ImageBase - g_HookRva;
+            scratch = (HOLY_SCRATCH*)(hvBase + g_ScratchRva);
+        }
+    }
+    if (scratch) {
+        if (scratch->magic != HOLY_SCRATCH_MAGIC)
+            scratch->magic = HOLY_SCRATCH_MAGIC;
+        scratch->vmexit_count++;
+        scratch->last_exit_reason = exitReason;
+        __vmx_vmread(HOLY_VMCS_GUEST_RIP, &scratch->last_guest_rip);
+    }
 
     const UINT32 cmd = (UINT32)gprs[0];
     UINT64 outA = 0, outB = 0, outC = 0;

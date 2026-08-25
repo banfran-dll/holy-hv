@@ -30,6 +30,11 @@
 //
 #define INTEL_VMEXIT_HANDLER_SIG "8B D5 E8 ? ? ? ? 48 8B 4C 24 ? FB 8B D6 0B 54 24 ? E8 ? ? ? ? E9"
 
+// Byte offsets within INTEL_VMEXIT_HANDLER_SIG (second E8 = CALL <handler>):
+#define INTEL_SIG_HANDLER_CALL_OFF   19
+#define INTEL_SIG_HANDLER_DISP_OFF   20
+#define INTEL_SIG_HANDLER_END_OFF    24
+
 extern UINT64 OriginalVmExitHandlerIntelAddr;
 
 // Function prototypes

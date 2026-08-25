@@ -94,34 +94,42 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
         return;
     }
 
-    // Sanity: scan+19 must be a near CALL (0xE8), and the target must lie
-    // inside hv.exe's original image range.
+    PIMAGE_DOS_HEADER hvDos = (PIMAGE_DOS_HEADER)imageBase;
+    PIMAGE_NT_HEADERS64 hvNt = (PIMAGE_NT_HEADERS64)(imageBase + hvDos->e_lfanew);
+    PIMAGE_SECTION_HEADER hvSecs = IMAGE_FIRST_SECTION(hvNt);
+
     if (isIntel)
     {
-        if (*(UINT8*)(scan + 19) != 0xE8) {
-            DebugFormat("[HOLY] abort: scan+19 is not 0xE8\n");
+        if (*(UINT8*)(scan + INTEL_SIG_HANDLER_CALL_OFF) != 0xE8) {
+            DebugFormat("[HOLY] abort: expected E8 at handler CALL offset\n");
             return;
         }
-        UINT64 origTarget = scan + 24 + *(INT32*)(scan + 20);
-        if (origTarget < imageBase || origTarget >= imageBase + 0x1600000) {
+        UINT64 origTarget = scan + INTEL_SIG_HANDLER_END_OFF
+                          + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF);
+        if (origTarget < imageBase ||
+            origTarget >= imageBase + hvNt->OptionalHeader.SizeOfImage) {
             DebugFormat("[HOLY] abort: origTarget 0x%p outside hv image\n", (VOID*)origTarget);
             return;
         }
     }
 
-    // Place the payload in the executable padding at the end of hv.exe's first
-    // executable section. PE headers are not modified -- hv still sees its
-    // original layout, but the payload now sits within hv's self-mapped range.
-    PIMAGE_DOS_HEADER hvDos = (PIMAGE_DOS_HEADER)imageBase;
-    PIMAGE_NT_HEADERS64 hvNt = (PIMAGE_NT_HEADERS64)(imageBase + hvDos->e_lfanew);
-    PIMAGE_SECTION_HEADER hvSecs = IMAGE_FIRST_SECTION(hvNt);
+    // Place the payload in the .text section padding of hv.exe.
     PIMAGE_SECTION_HEADER textSec = NULL;
     UINT16 textIdx = 0;
     for (UINT16 si = 0; si < hvNt->FileHeader.NumberOfSections; si++) {
-        if (hvSecs[si].Characteristics & EFI_IMAGE_SCN_MEM_EXECUTE) {
+        if (CompareMem(hvSecs[si].Name, ".text\0\0\0", IMAGE_SIZEOF_SHORT_NAME) == 0) {
             textSec = &hvSecs[si];
             textIdx = si;
             break;
+        }
+    }
+    if (!textSec) {
+        for (UINT16 si = 0; si < hvNt->FileHeader.NumberOfSections; si++) {
+            if (hvSecs[si].Characteristics & EFI_IMAGE_SCN_MEM_EXECUTE) {
+                textSec = &hvSecs[si];
+                textIdx = si;
+                break;
+            }
         }
     }
     if (!textSec) {
@@ -171,7 +179,8 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
 
 #if HOLY_HV_MUTATION_STAGE >= HOLY_HV_MUTATION_STAGE_PATCH
     if (isIntel) {
-        OriginalVmExitHandlerIntelAddr = scan + 24 + *(INT32*)(scan + 20);
+        OriginalVmExitHandlerIntelAddr = scan + INTEL_SIG_HANDLER_END_OFF
+                                       + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF);
     }
 #endif
 
@@ -183,11 +192,20 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
         PIMAGE_SECTION_HEADER dataSec = NULL;
         UINT16 dataIdx = 0;
         for (UINT16 si = 0; si < hvNt->FileHeader.NumberOfSections; si++) {
-            UINT32 ch = hvSecs[si].Characteristics;
-            if ((ch & EFI_IMAGE_SCN_MEM_WRITE) && !(ch & EFI_IMAGE_SCN_MEM_EXECUTE)) {
+            if (CompareMem(hvSecs[si].Name, ".data\0\0\0", IMAGE_SIZEOF_SHORT_NAME) == 0) {
                 dataSec = &hvSecs[si];
                 dataIdx = si;
                 break;
+            }
+        }
+        if (!dataSec) {
+            for (UINT16 si = 0; si < hvNt->FileHeader.NumberOfSections; si++) {
+                UINT32 ch = hvSecs[si].Characteristics;
+                if ((ch & EFI_IMAGE_SCN_MEM_WRITE) && !(ch & EFI_IMAGE_SCN_MEM_EXECUTE)) {
+                    dataSec = &hvSecs[si];
+                    dataIdx = si;
+                    break;
+                }
             }
         }
         if (dataSec) {
@@ -277,7 +295,7 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
         //   [27] C3              ret               ; back to scan+24
         {
             UINT8* stub = (UINT8*)section;
-            const UINT64 origAddr = (UINT64)(scan + 24 + *(INT32*)(scan + 20));
+            const UINT64 origAddr = (UINT64)(scan + INTEL_SIG_HANDLER_END_OFF + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF));
             const UINT64 remoteFn = section + offset;
 
             stub[ 0] = 0x51;
@@ -294,7 +312,7 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
             *(INT32*)(stub + 23) = (INT32)((INT64)origAddr - (INT64)(section + 27));
             stub[27] = 0xC3;
 
-            *(INT32*)(scan + 20) = (INT32)((INT64)section - (INT64)(scan + 20) - 4);
+            *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF) = (INT32)((INT64)section - (INT64)(scan + INTEL_SIG_HANDLER_END_OFF));
 
             DebugFormat("[HOLY] stub@%p hook=%p orig=%p\n",
                 (VOID*)section, (VOID*)remoteFn, (VOID*)origAddr);
