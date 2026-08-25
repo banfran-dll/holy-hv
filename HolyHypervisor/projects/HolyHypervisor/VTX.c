@@ -197,11 +197,11 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
     if ((UINT64)gprs <= 0x1000ull) return 0;
 
     // Hypervisor Vendor ID spoofing (CPUID leaf 0x40000000)
-    if ((UINT32)gprs[0] == 0x40000000u) {
-        gprs[0] = 0x40000000u; // Max CPUID leaf
-        gprs[3] = 0x796C6F48u; // "Holy" (EBX)
-        gprs[1] = 0x42207648u; // "Hv B" (ECX)
-        gprs[2] = 0x646B6361u; // "ackd" (EDX)
+    if ((UINT32)gprs[INTEL_GPR_RAX] == 0x40000000u) {
+        gprs[INTEL_GPR_RAX] = 0x40000000u;
+        gprs[INTEL_GPR_RBX] = 0x796C6F48u; // "Holy"
+        gprs[INTEL_GPR_RCX] = 0x42207648u; // "Hv B"
+        gprs[INTEL_GPR_RDX] = 0x646B6361u; // "ackd"
 
         UINT64 rip = 0, len = 0;
         __vmx_vmread(HOLY_VMCS_GUEST_RIP, &rip);
@@ -210,7 +210,7 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
         return 1;
     }
 
-    if ((UINT32)gprs[1] != HOLY_KEY) return 0;     // not our backdoor
+    if ((UINT32)gprs[INTEL_GPR_RCX] != HOLY_KEY) return 0;
 
     HOLY_SCRATCH* scratch = NULL;
     {
@@ -230,7 +230,7 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
         __vmx_vmread(HOLY_VMCS_GUEST_RIP, &scratch->last_guest_rip);
     }
 
-    const UINT32 cmd = (UINT32)gprs[0];
+    const UINT32 cmd = (UINT32)gprs[INTEL_GPR_RAX];
     UINT64 outA = 0, outB = 0, outC = 0;
     UINT32 status = HOLY_STATUS_OK;
 
@@ -287,8 +287,8 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
             //   sub-mode 0: echo-only (no dereference, just return the VA)
             //   sub-mode 1: read from &HookedVmExitHandlerIntel (ignore VA)
             //   sub-mode 2: read from user VA (original behavior)
-            UINT64 va   = gprs[2];   // guest RDX = target VA
-            UINT64 mode = gprs[8];   // guest R8  = sub-mode
+            UINT64 va   = gprs[INTEL_GPR_RDX];
+            UINT64 mode = gprs[INTEL_GPR_R8];
             if (mode == 0) {
                 outA = va;
                 outB = 0xEC000001ull;
@@ -306,9 +306,9 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
                     outC = p[2];
                 }
             } else {
-                // mode 3: compare gprs[2] vs &HookedVmExitHandlerIntel
+                // mode 3: compare gprs[RDX] vs &HookedVmExitHandlerIntel
                 UINT64 actual = (UINT64)&HookedVmExitHandlerIntel;
-                outA = va;              // what gprs[2] holds
+                outA = va;
                 outB = actual;          // what &HookedVmExitHandlerIntel is NOW
                 outC = va - actual;     // delta (0 = match)
             }
@@ -316,7 +316,7 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
         }
 
         case HOLY_CMD_HV_READ: {
-            UINT64 va = gprs[2];
+            UINT64 va = gprs[INTEL_GPR_RDX];
             if (va == 0) { status = HOLY_STATUS_BAD_ARG; break; }
             // canonical check: bits 63:47 must be all-0 or all-1
             UINT64 top17 = (va >> 47);
@@ -332,8 +332,8 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
         }
 
         case HOLY_CMD_HV_WRITE: {
-            UINT64 va  = gprs[2];   // target host VA
-            UINT64 val = gprs[8];   // value to write
+            UINT64 va  = gprs[INTEL_GPR_RDX];
+            UINT64 val = gprs[INTEL_GPR_R8];
             if (va == 0) { status = HOLY_STATUS_BAD_ARG; break; }
             UINT64 top17 = (va >> 47);
             if (top17 != 0 && top17 != 0x1FFFFull) {
@@ -357,7 +357,7 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
             extern IMAGE_DOS_HEADER __ImageBase;
             UINT64 hvBase = (UINT64)&__ImageBase - g_HookRva;
             // sub-mode via R8: 0 = addresses, 1 = section diag
-            UINT64 sub = gprs[8];
+            UINT64 sub = gprs[INTEL_GPR_R8];
             if (sub == 0) {
                 outA = (g_ScratchRva != 0) ? hvBase + g_ScratchRva : 0;
                 outB = hvBase;
@@ -395,10 +395,10 @@ UINT64 HookedVmExitHandlerIntel(PGUEST_CONTEXT context, VOID* unknown)
             break;
     }
 
-    gprs[0] = (UINT64)status;
-    gprs[3] = outA;
-    gprs[1] = outB;
-    gprs[2] = outC;
+    gprs[INTEL_GPR_RAX] = (UINT64)status;
+    gprs[INTEL_GPR_RBX] = outA;
+    gprs[INTEL_GPR_RCX] = outB;
+    gprs[INTEL_GPR_RDX] = outC;
 
     UINT64 rip = 0, len = 0;
     __vmx_vmread(HOLY_VMCS_GUEST_RIP, &rip);

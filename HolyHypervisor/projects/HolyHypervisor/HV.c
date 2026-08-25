@@ -10,6 +10,21 @@
 //  PT mapping is not phys=virt at BlLdrLoadImage time. The hook will translate
 //  addresses through hv's own PT in a later step.)
 
+// Known Intel VMEXIT dispatch-loop signatures (first match wins).
+// To add a new Win11 build: dump the bytes around the handler CALL in
+// IDA/Ghidra, add a row with the E8 opcode's byte offset within the pattern.
+static const INTEL_VMEXIT_SIG_ENTRY g_IntelVmexitSigs[] = {
+    // mov edx,ebp / call <mitig> / mov rcx,[rsp+?] / sti /
+    // mov edx,esi / or edx,[rsp+?] / call <handler> / jmp <loop>
+    {
+        "8B D5 E8 ? ? ? ? 48 8B 4C 24 ? FB 8B D6 0B 54 24 ? E8 ? ? ? ? E9",
+        19, 20, 24,
+        "Win11-26100"
+    },
+};
+#define INTEL_VMEXIT_SIG_COUNT \
+    (sizeof(g_IntelVmexitSigs) / sizeof(g_IntelVmexitSigs[0]))
+
 extern IMAGE_DOS_HEADER __ImageBase;
 VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
 {
@@ -41,13 +56,18 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
 
     UINT64 scan = 0;
     BOOLEAN isIntel = FALSE;
+    const INTEL_VMEXIT_SIG_ENTRY* sig = NULL;
 
-    // Scan for Intel signature first
-    scan = FindPatternImage((VOID*)imageBase, INTEL_VMEXIT_HANDLER_SIG);
-    if (scan) {
-        isIntel = TRUE;
-    } else {
-        // If Intel not found, try AMD signature
+    for (UINTN si = 0; si < INTEL_VMEXIT_SIG_COUNT; si++) {
+        scan = FindPatternImage((VOID*)imageBase, g_IntelVmexitSigs[si].pattern);
+        if (scan) {
+            sig = &g_IntelVmexitSigs[si];
+            isIntel = TRUE;
+            DebugFormat("[HOLY] Intel sig matched: %a\n", sig->build);
+            break;
+        }
+    }
+    if (!scan) {
         scan = FindPatternImage((VOID*)imageBase, "E8 ? ? ? ? 48 89 04 24 E9");
     }
 
@@ -100,12 +120,12 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
 
     if (isIntel)
     {
-        if (*(UINT8*)(scan + INTEL_SIG_HANDLER_CALL_OFF) != 0xE8) {
+        if (*(UINT8*)(scan + sig->call_off) != 0xE8) {
             DebugFormat("[HOLY] abort: expected E8 at handler CALL offset\n");
             return;
         }
-        UINT64 origTarget = scan + INTEL_SIG_HANDLER_END_OFF
-                          + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF);
+        UINT64 origTarget = scan + sig->end_off
+                          + *(INT32*)(scan + sig->disp_off);
         if (origTarget < imageBase ||
             origTarget >= imageBase + hvNt->OptionalHeader.SizeOfImage) {
             DebugFormat("[HOLY] abort: origTarget 0x%p outside hv image\n", (VOID*)origTarget);
@@ -179,8 +199,8 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
 
 #if HOLY_HV_MUTATION_STAGE >= HOLY_HV_MUTATION_STAGE_PATCH
     if (isIntel) {
-        OriginalVmExitHandlerIntelAddr = scan + INTEL_SIG_HANDLER_END_OFF
-                                       + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF);
+        OriginalVmExitHandlerIntelAddr = scan + sig->end_off
+                                       + *(INT32*)(scan + sig->disp_off);
     }
 #endif
 
@@ -295,7 +315,7 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
         //   [27] C3              ret               ; back to scan+24
         {
             UINT8* stub = (UINT8*)section;
-            const UINT64 origAddr = (UINT64)(scan + INTEL_SIG_HANDLER_END_OFF + *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF));
+            const UINT64 origAddr = (UINT64)(scan + sig->end_off + *(INT32*)(scan + sig->disp_off));
             const UINT64 remoteFn = section + offset;
 
             stub[ 0] = 0x51;
@@ -312,7 +332,7 @@ VOID ProcessHvImage(const UINT64 imageBase, const CHAR16* imageName)
             *(INT32*)(stub + 23) = (INT32)((INT64)origAddr - (INT64)(section + 27));
             stub[27] = 0xC3;
 
-            *(INT32*)(scan + INTEL_SIG_HANDLER_DISP_OFF) = (INT32)((INT64)section - (INT64)(scan + INTEL_SIG_HANDLER_END_OFF));
+            *(INT32*)(scan + sig->disp_off) = (INT32)((INT64)section - (INT64)(scan + sig->end_off));
 
             DebugFormat("[HOLY] stub@%p hook=%p orig=%p\n",
                 (VOID*)section, (VOID*)remoteFn, (VOID*)origAddr);
