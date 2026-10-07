@@ -113,3 +113,7 @@ The original HolyHypervisor/SecureHack research tree references prior public
 research projects and ideas, including Voyager, DmaBackdoorHv, and VisualUefi.
 See `HolyHypervisor/README.md` for the original upstream-style notes and
 credits retained in this repository.
+
+## 네이밍
+
+하이퍼바이져를 공부하면서 여러가지가 기독교 안에서 '예수'와 겹쳐보여 프로젝트 이름을 holy라고 지었습니다.
